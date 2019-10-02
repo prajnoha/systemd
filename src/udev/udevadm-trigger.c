@@ -10,6 +10,7 @@
 #include "device-private.h"
 #include "fd-util.h"
 #include "fileio.h"
+#include "id128-util.h"
 #include "path-util.h"
 #include "process-util.h"
 #include "set.h"
@@ -20,15 +21,27 @@
 #include "udev-ctrl.h"
 #include "virt.h"
 
+struct trigger {
+        const char *action;
+        char synth_uuid[SD_ID128_UUID_STRING_MAX];
+        Set *settle_set;
+};
+
 static bool arg_verbose = false;
 static bool arg_dry_run = false;
 
-static int exec_list(sd_device_enumerator *e, const char *action, Set *settle_set) {
+static int exec_list(sd_device_enumerator *e, struct trigger *trigger) {
+        _cleanup_free_ char *full_action = NULL;
         sd_device *d;
         int r, ret = 0;
 
+        full_action = strjoin(trigger->action, " ", trigger->synth_uuid, " UDEVTRIGGER=1");
+        if (!full_action)
+                return log_oom();
+
         FOREACH_DEVICE_AND_SUBSYSTEM(e, d) {
                 _cleanup_free_ char *filename = NULL;
+                _cleanup_free_ char *key = NULL;
                 const char *syspath;
 
                 if (sd_device_get_syspath(d, &syspath) < 0)
@@ -43,19 +56,23 @@ static int exec_list(sd_device_enumerator *e, const char *action, Set *settle_se
                 if (!filename)
                         return log_oom();
 
-                r = write_string_file(filename, action, WRITE_STRING_FILE_DISABLE_BUFFER);
+                r = write_string_file(filename, full_action, WRITE_STRING_FILE_DISABLE_BUFFER);
                 if (r < 0) {
                         bool ignore = IN_SET(r, -ENOENT, -EACCES, -ENODEV);
 
                         log_full_errno(ignore ? LOG_DEBUG : LOG_ERR, r,
-                                       "Failed to write '%s' to '%s': %m", action, filename);
+                                       "Failed to write '%s' to '%s': %m", full_action, filename);
                         if (ret == 0 && !ignore)
                                 ret = r;
                         continue;
                 }
 
-                if (settle_set) {
-                        r = set_put_strdup(settle_set, syspath);
+                if (trigger->settle_set) {
+                        key = strjoin(trigger->synth_uuid, syspath);
+                        if (!key)
+                                return log_oom();
+
+                        r = set_put_strdup(trigger->settle_set, key);
                         if (r < 0)
                                 return log_oom();
                 }
@@ -65,24 +82,35 @@ static int exec_list(sd_device_enumerator *e, const char *action, Set *settle_se
 }
 
 static int device_monitor_handler(sd_device_monitor *m, sd_device *dev, void *userdata) {
+        _cleanup_free_ char *key = NULL;
         _cleanup_free_ char *val = NULL;
-        Set *settle_set = userdata;
-        const char *syspath;
+        struct trigger *trigger = userdata;
+        const char *syspath, *synth_uuid_str;
 
         assert(dev);
-        assert(settle_set);
+        assert(trigger->settle_set);
 
         if (sd_device_get_syspath(dev, &syspath) < 0)
                 return 0;
 
+        if (sd_device_get_property_value(dev, "SYNTH_UUID", &synth_uuid_str) < 0)
+                return 0;
+
+        if (!streq(synth_uuid_str, trigger->synth_uuid))
+                return 0;
+
+        key = strjoin(synth_uuid_str, syspath);
+        if (!key)
+                return log_oom();
+
         if (arg_verbose)
-                printf("settle %s\n", syspath);
+                printf("settle %s\n", key);
 
-        val = set_remove(settle_set, syspath);
+        val = set_remove(trigger->settle_set, key);
         if (!val)
-                log_debug("Got epoll event on syspath %s not present in syspath set", syspath);
+                log_debug("Got epoll event on uuid/syspath %s not present in uuid/syspath set", key);
 
-        if (set_isempty(settle_set))
+        if (set_isempty(trigger->settle_set))
                 return sd_event_exit(sd_device_monitor_get_event(m), 0);
 
         return 0;
@@ -165,13 +193,16 @@ int trigger_main(int argc, char *argv[], void *userdata) {
                 TYPE_DEVICES,
                 TYPE_SUBSYSTEMS,
         } device_type = TYPE_DEVICES;
-        const char *action = "change";
         _cleanup_(sd_device_enumerator_unrefp) sd_device_enumerator *e = NULL;
         _cleanup_(sd_device_monitor_unrefp) sd_device_monitor *m = NULL;
         _cleanup_(sd_event_unrefp) sd_event *event = NULL;
         _cleanup_set_free_free_ Set *settle_set = NULL;
+        struct trigger trigger = {.action = device_action_to_string(DEVICE_ACTION_CHANGE),
+                                  .synth_uuid[0] = '\0',
+                                  .settle_set = NULL};
         usec_t ping_timeout_usec = 5 * USEC_PER_SEC;
         bool settle = false, ping = false;
+        sd_id128_t id = SD_ID128_NULL;
         int c, r;
 
         if (running_in_chroot() > 0) {
@@ -214,7 +245,7 @@ int trigger_main(int argc, char *argv[], void *userdata) {
                         if (device_action_from_string(optarg) < 0)
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Unknown action '%s'", optarg);
 
-                        action = optarg;
+                        trigger.action = optarg;
                         break;
                 case 's':
                         r = sd_device_enumerator_add_match_subsystem(e, optarg, true);
@@ -338,10 +369,15 @@ int trigger_main(int argc, char *argv[], void *userdata) {
                         return log_error_errno(r, "Failed to add parent match '%s': %m", argv[optind]);
         }
 
+        assert_se(sd_id128_randomize(&id) >= 0);
+        id128_to_uuid_string(id, trigger.synth_uuid);
+
         if (settle) {
                 settle_set = set_new(&string_hash_ops);
                 if (!settle_set)
                         return log_oom();
+
+                trigger.settle_set = settle_set;
 
                 r = sd_event_default(&event);
                 if (r < 0)
@@ -355,7 +391,7 @@ int trigger_main(int argc, char *argv[], void *userdata) {
                 if (r < 0)
                         return log_error_errno(r, "Failed to attach event to device monitor: %m");
 
-                r = sd_device_monitor_start(m, device_monitor_handler, settle_set);
+                r = sd_device_monitor_start(m, device_monitor_handler, &trigger);
                 if (r < 0)
                         return log_error_errno(r, "Failed to start device monitor: %m");
         }
@@ -374,11 +410,12 @@ int trigger_main(int argc, char *argv[], void *userdata) {
         default:
                 assert_not_reached("Unknown device type");
         }
-        r = exec_list(e, action, settle_set);
+
+        r = exec_list(e, &trigger);
         if (r < 0)
                 return r;
 
-        if (event && !set_isempty(settle_set)) {
+        if (event && !set_isempty(trigger.settle_set)) {
                 r = sd_event_loop(event);
                 if (r < 0)
                         return log_error_errno(r, "Event loop failed: %m");
