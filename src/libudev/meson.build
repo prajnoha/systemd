@@ -10,6 +10,7 @@ libudev_sources = files('''
         libudev-list-internal.h
         libudev-monitor.c
         libudev-queue.c
+        libudev-trigger.c
         libudev-util.c
         libudev-util.h
 '''.split())
