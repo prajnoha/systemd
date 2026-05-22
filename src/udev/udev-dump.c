@@ -39,6 +39,20 @@ static int dump_event_json(UdevEvent *event, sd_json_format_flags_t flags, FILE 
         const char *str;
         int r;
 
+        sd_device_action_t action;
+        if (sd_device_get_action(dev, &action) >= 0) {
+                r = sd_json_variant_set_field_string(&v, "action", device_action_to_string(action));
+                if (r < 0)
+                        return r;
+        }
+
+        uint64_t seqnum;
+        if (sd_device_get_seqnum(dev, &seqnum) >= 0) {
+                r = sd_json_variant_set_field_unsigned(&v, "seqnum", seqnum);
+                if (r < 0)
+                        return r;
+        }
+
         if (sd_device_get_devpath(dev, &str) >= 0) {
                 r = sd_json_variant_set_field_string(&v, "path", str);
                 if (r < 0)
@@ -319,6 +333,14 @@ int dump_event(UdevEvent *event, sd_json_format_flags_t flags, FILE *f) {
 
         if (!f)
                 f = stdout;
+
+        sd_device_action_t action;
+        if (sd_device_get_action(dev, &action) >= 0)
+                fprintf(f, "%sAction:%s\n  %s\n", ansi_highlight(), ansi_normal(), device_action_to_string(action));
+
+        uint64_t seqnum;
+        if (sd_device_get_seqnum(dev, &seqnum) >= 0)
+                fprintf(f, "%sSequence number:%s\n  %" PRIu64 "\n", ansi_highlight(), ansi_normal(), seqnum);
 
         if (sd_device_get_devpath(dev, &str) >= 0)
                 fprintf(f, "%sDevice path:%s\n  %s\n", ansi_highlight(), ansi_normal(), str);
